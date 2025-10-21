@@ -1,0 +1,71 @@
+name: Security / Build & Curl
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  backend:
+    name: Build & Test Backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & run backend + db
+        run: |
+          docker compose up -d --build postgres_flask backend
+
+      - name: Wait for backend
+        run: |
+          for i in {1..60}; do
+            if curl -sSf http://localhost:5000 >/dev/null 2>&1; then
+              echo "Backend up"
+              exit 0
+            fi
+            echo "Waiting backend... $i"
+            sleep 2
+          done
+          echo "Backend did not start in time"
+          docker compose logs backend || true
+          exit 1
+
+      - name: Curl backend root
+        run: curl -sSf http://localhost:5000
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v
+
+  frontend:
+    name: Build & Test Frontend
+    runs-on: ubuntu-latest
+    needs: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & run full stack
+        run: |
+          docker compose up -d --build postgres_flask backend frontend
+
+      - name: Wait for frontend
+        run: |
+          for i in {1..60}; do
+            if curl -sSf http://localhost:5173 >/dev/null 2>&1; then
+              echo "Frontend up"
+              exit 0
+            fi
+            echo "Waiting frontend... $i"
+            sleep 2
+          done
+          echo "Frontend did not start in time"
+          docker compose logs frontend || true
+          exit 1
+
+      - name: Curl frontend root
+        run: curl -sSf http://localhost:5173
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v

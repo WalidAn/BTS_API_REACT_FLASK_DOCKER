@@ -1,0 +1,96 @@
+name: Security Scans
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+      # récupère le code au complet (utile si monorepo)
+      # pour économiser, tu peux enlever fetch-depth si besoin
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Prepare reports dir
+        run: mkdir -p reports
+
+      - name: Install backend dependencies
+        run: |
+          python -m venv venv
+          . venv/bin/activate
+          pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Snyk Open Source (pip) → JSON
+        # continue-on-error pour qu'on ait quand même les artefacts
+        continue-on-error: true
+        uses: snyk/actions/python@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: >
+            test --file=backend/requirements.txt
+            --package-manager=pip
+            --json-file-output=reports/snyk-oss-backend.json
+            --severity-threshold=low
+
+      - name: Convert Snyk JSON → HTML
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, html, pathlib
+          p = pathlib.Path('reports/snyk-oss-backend.json')
+          out = pathlib.Path('reports/snyk-oss-backend.html')
+
+          # lecture (tolérante si le JSON est vide / absent)
+          data = {}
+          if p.exists() and p.stat().st_size:
+              try:
+                  data = json.loads(p.read_text())
+              except Exception as e:
+                  data = {"error": f"Invalid JSON: {e}"}
+
+          # mini rendu HTML (lisible par ton prof)
+          def h(s): return html.escape(s, quote=False)
+          title = "Snyk OSS (backend)"
+          pre = h(json.dumps(data, indent=2, ensure_ascii=False)) if data else "<em>Aucun résultat ou échec du scan.</em>"
+          html_doc = f"""<!doctype html>
+          <html lang="fr"><meta charset="utf-8">
+          <title>{title}</title>
+          <style>
+            body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:20px;}}
+            h1{{font-size:1.25rem}}
+            pre{{white-space:pre-wrap;word-break:break-word;background:#0b1021;color:#e6e8ee;padding:16px;border-radius:8px;}}
+          </style>
+          <h1>{title}</h1>
+          <p>Rapport généré automatiquement depuis le JSON Snyk.</p>
+          <pre>{pre}</pre>
+          </html>"""
+          out.write_text(html_doc)
+          print(f"Écrit: {out}")
+          PY
+
+      - name: Upload reports (JSON + HTML)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/*
+          if-no-files-found: warn
