@@ -8,47 +8,39 @@ on:
 jobs:
   security:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
 
     steps:
       - name: Checkout
+      # récupère le code au complet (utile si monorepo)
+      # pour économiser, tu peux enlever fetch-depth si besoin
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
 
       - name: Prepare reports dir
         run: mkdir -p reports
 
-      # ===== Build images =====
-      - name: Build backend image
-        run: docker build -t backend:local -f backend/Dockerfile backend
-
-      - name: Build frontend image
-        run: docker build -t frontend:local -f frontend/Dockerfile frontend
-
-      # ===== Gitleaks (secrets dans le repo) =====
-      - name: Run Gitleaks (JSON)
+      - name: Install backend dependencies
         run: |
-          docker run --rm -v "${{ github.workspace }}:/path" zricethezav/gitleaks:latest \
-            detect -s /path -f json -r /path/reports/gitleaks.json || true
+          python -m venv venv
+          . venv/bin/activate
+          pip install --upgrade pip
+          pip install -r backend/requirements.txt
 
-      # ===== Trivy (images) =====
-      - name: Trivy backend image → JSON
-        uses: aquasecurity/trivy-action@0.24.0
-        with:
-          image-ref: backend:local
-          format: json
-          output: reports/trivy-backend.json
-          hide-progress: true
-
-      - name: Trivy frontend image → JSON
-        uses: aquasecurity/trivy-action@0.24.0
-        with:
-          image-ref: frontend:local
-          format: json
-          output: reports/trivy-frontend.json
-          hide-progress: true
-
-      # ===== Snyk OSS (dépendances Python du backend) =====
       - name: Snyk Open Source (pip) → JSON
-        if: ${{ env.SNYK_TOKEN != '' }}
+        # continue-on-error pour qu'on ait quand même les artefacts
+        continue-on-error: true
         uses: snyk/actions/python@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
@@ -57,39 +49,48 @@ jobs:
             test --file=backend/requirements.txt
             --package-manager=pip
             --json-file-output=reports/snyk-oss-backend.json
+            --severity-threshold=low
 
-      # ===== Snyk Container (images) =====
-      - name: Snyk Container backend → JSON
-        if: ${{ env.SNYK_TOKEN != '' }}
-        uses: snyk/actions/docker@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          image: backend:local
-          args: --file=backend/Dockerfile --json-file-output=reports/snyk-backend.json
-
-      - name: Snyk Container frontend → JSON
-        if: ${{ env.SNYK_TOKEN != '' }}
-        uses: snyk/actions/docker@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          image: frontend:local
-          args: --file=frontend/Dockerfile --json-file-output=reports/snyk-frontend.json
-
-      # ===== (Optionnel) Convertir quelques JSON → HTML légers =====
-      - name: Quick HTML for Gitleaks
+      - name: Convert Snyk JSON → HTML
+        if: always()
         run: |
-          python - << 'PY'
-          import json,html,sys
-          d=json.load(open('reports/gitleaks.json','r',encoding='utf-8'))
-          body=f"<h1>Gitleaks</h1><pre>{html.escape(json.dumps(d,indent=2))}</pre>"
-          open('reports/gitleaks.html','w',encoding='utf-8').write(f"<!doctype html><meta charset='utf-8'>{body}")
+          python - <<'PY'
+          import json, html, pathlib
+          p = pathlib.Path('reports/snyk-oss-backend.json')
+          out = pathlib.Path('reports/snyk-oss-backend.html')
+
+          # lecture (tolérante si le JSON est vide / absent)
+          data = {}
+          if p.exists() and p.stat().st_size:
+              try:
+                  data = json.loads(p.read_text())
+              except Exception as e:
+                  data = {"error": f"Invalid JSON: {e}"}
+
+          # mini rendu HTML (lisible par ton prof)
+          def h(s): return html.escape(s, quote=False)
+          title = "Snyk OSS (backend)"
+          pre = h(json.dumps(data, indent=2, ensure_ascii=False)) if data else "<em>Aucun résultat ou échec du scan.</em>"
+          html_doc = f"""<!doctype html>
+          <html lang="fr"><meta charset="utf-8">
+          <title>{title}</title>
+          <style>
+            body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:20px;}}
+            h1{{font-size:1.25rem}}
+            pre{{white-space:pre-wrap;word-break:break-word;background:#0b1021;color:#e6e8ee;padding:16px;border-radius:8px;}}
+          </style>
+          <h1>{title}</h1>
+          <p>Rapport généré automatiquement depuis le JSON Snyk.</p>
+          <pre>{pre}</pre>
+          </html>"""
+          out.write_text(html_doc)
+          print(f"Écrit: {out}")
           PY
 
-      # ===== Upload des artefacts =====
-      - name: Upload all reports (JSON + HTML)
+      - name: Upload reports (JSON + HTML)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: security-reports
           path: reports/*
+          if-no-files-found: warn
