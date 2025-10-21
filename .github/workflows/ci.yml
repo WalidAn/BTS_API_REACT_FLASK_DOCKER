@@ -1,0 +1,92 @@
+name: Security Scans
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare reports dir
+        run: mkdir -p reports .trivy-cache
+
+      - name: Build Docker image
+        run: docker build -t devsecure-api:local .
+
+      # --- TRIVY (HTML) ---
+      - name: Run Trivy
+        run: |
+          docker run --rm \
+            -v "$PWD:/workdir" \
+            -v "$PWD/.trivy-cache:/root/.cache/" \
+            aquasec/trivy:latest image devsecure-api:local \
+            --format template --template "@/contrib/html.tpl" \
+            -o /workdir/reports/trivy-image.html || true
+
+      # --- GITLEAKS (JSON -> HTML) ---
+      - name: Run Gitleaks (JSON)
+        run: |
+          docker run --rm -v "$PWD:/path" zricethezav/gitleaks:latest \
+            detect -s /path -r /path/reports/gitleaks.json || true
+
+      - name: Convert Gitleaks JSON → HTML
+        run: |
+          jq -r '
+            def esc(s): s|gsub("&";"&amp;")|gsub("<";"&lt;")|gsub(">";"&gt;");
+            "<html><head><meta charset=\"utf-8\"><title>Gitleaks Report</title></head><body>" +
+            "<h1>Gitleaks Report</h1>" +
+            ( if (type=="array" and length==0) or (.findings//.results//[] | length)==0
+              then "<p>No leaks found.</p>"
+              else
+                "<table border=1 cellpadding=4 cellspacing=0><tr><th>Rule</th><th>File</th><th>StartLine</th><th>Match</th></tr>" +
+                ( (if type=="array" then . else (.findings//.results) end)
+                  | map("<tr><td>" + ( .RuleID//.rule//"" | tostring | esc ) +
+                        "</td><td>" + ( .File//.file//"" | esc ) +
+                        "</td><td>" + ( (.StartLine//.start_line//0)|tostring ) +
+                        "</td><td>" + ( .Match//.secret//"" | esc ) + "</td></tr>")
+                  | join("") ) +
+                "</table>"
+            end ) + "</body></html>"
+          ' reports/gitleaks.json > reports/gitleaks.html \
+          || echo '<html><body><p>No Gitleaks report.</p></body></html>' > reports/gitleaks.html
+
+      # --- SNYK (JSON -> HTML) ---
+      - name: Run Snyk Container
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          docker run --rm \
+            -e SNYK_TOKEN="${SNYK_TOKEN}" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/project" -w /project \
+            snyk/snyk:docker \
+            sh -c 'snyk container test devsecure-api:local --file=/project/Dockerfile --json > /project/reports/snyk-container.json || true'
+
+      - name: Convert Snyk JSON → HTML
+        run: |
+          jq -r '
+            "<html><head><meta charset=\"utf-8\"><title>Snyk Container Report</title></head><body>" +
+            "<h1>Snyk Container Report</h1>" +
+            ( if (.vulnerabilities//[] | length)==0
+              then "<p>No vulnerabilities found.</p>"
+              else
+                "<table border=1 cellpadding=4 cellspacing=0><tr><th>Severity</th><th>ID</th><th>Package</th><th>Version</th><th>Title</th></tr>" +
+                ( .vulnerabilities
+                  | map("<tr><td>"+(.severity//"")+"</td><td>"+(.id//"")+"</td><td>"+(.packageName//"")+"</td><td>"+(.version//"")+"</td><td>"+(.title//"")+"</td></tr>")
+                  | join("") ) +
+                "</table>"
+            end ) + "</body></html>"
+          ' reports/snyk-container.json > reports/snyk-container.html \
+          || echo '<html><body><p>No Snyk report.</p></body></html>' > reports/snyk-container.html
+
+      # --- UPLOAD HTML REPORTS ---
+      - name: Upload HTML reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-html
+          path: reports/*.html
